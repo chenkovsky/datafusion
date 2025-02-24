@@ -739,6 +739,7 @@ fn roundtrip_parquet_exec_with_pruning_predicate() -> Result<()> {
         file_compression_type: FileCompressionType::UNCOMPRESSED,
         new_lines_in_values: false,
         source,
+        metadata_columns: None,
     };
 
     roundtrip_test(scan_config.build())
@@ -770,6 +771,7 @@ async fn roundtrip_parquet_exec_with_table_partition_cols() -> Result<()> {
         file_compression_type: FileCompressionType::UNCOMPRESSED,
         new_lines_in_values: false,
         source,
+        metadata_columns: None,
     };
 
     roundtrip_test(scan_config.build())
@@ -811,6 +813,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
         file_compression_type: FileCompressionType::UNCOMPRESSED,
         new_lines_in_values: false,
         source,
+        metadata_columns: None,
     };
 
     #[derive(Debug, Clone, Eq)]

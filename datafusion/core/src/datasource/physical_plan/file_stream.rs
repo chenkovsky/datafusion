@@ -75,6 +75,12 @@ impl FileStream {
         file_opener: Arc<dyn FileOpener>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
+        let metadata_projection = config.projection.as_ref().map( |projection| projection.clone().into_iter().enumerate().filter(|(_, col_id)| {
+            match datafusion_common::FieldId::from(*col_id) {
+                datafusion_common::FieldId::Metadata(_) => true,
+                _ => false,
+            }
+        }).collect::<Vec<_>>()).unwrap_or(vec![]);
         let (projected_schema, ..) = config.project();
         let pc_projector = PartitionColumnProjector::new(
             Arc::clone(&projected_schema),
@@ -83,6 +89,7 @@ impl FileStream {
                 .iter()
                 .map(|x| x.name().clone())
                 .collect::<Vec<_>>(),
+            &metadata_projection,
         );
 
         let files = config.file_groups[partition].clone();

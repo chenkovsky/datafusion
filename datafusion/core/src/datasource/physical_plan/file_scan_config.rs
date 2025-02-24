@@ -123,6 +123,10 @@ pub struct FileScanConfig {
     /// appear in the files. It does not include table partition columns
     /// that may be added.
     pub file_schema: SchemaRef,
+
+    /// Schema of the metadata columns
+    pub metadata_columns: Option<SchemaRef>,
+
     /// List of files to be processed, grouped into partitions
     ///
     /// Each file must have a schema of `file_schema` or a subset. If
@@ -312,10 +316,22 @@ impl FileScanConfig {
             file_compression_type: FileCompressionType::UNCOMPRESSED,
             new_lines_in_values: false,
             source: Arc::clone(&file_source),
+            metadata_columns: None,
         };
 
         config = config.with_source(Arc::clone(&file_source));
         config
+    }
+
+
+    /// Set the schema of metadata columns
+    ///
+    /// # Parameters
+    /// * `metadata_columns`: Optional schema reference containing metadata column definitions.
+    ///                      If None, no metadata columns will be included.
+    pub fn with_metadata_columns(mut self, metadata_columns: Option<SchemaRef>) -> Self {
+        self.metadata_columns = metadata_columns;
+        self
     }
 
     /// Set the file source
@@ -444,10 +460,25 @@ impl FileScanConfig {
                 table_fields.push(field.clone());
                 table_cols_stats.push(self.statistics.column_statistics[*idx].clone())
             } else {
-                let partition_idx = idx - self.file_schema.fields().len();
-                table_fields.push(self.table_partition_cols[partition_idx].to_owned());
-                // TODO provide accurate stat for partition column (#1186)
-                table_cols_stats.push(ColumnStatistics::new_unknown())
+                match datafusion_common::FieldId::from(*idx) {
+                    datafusion_common::FieldId::Metadata(idx) => {
+                        match &self.metadata_columns {
+                            Some(metadata_columns) => {
+                                table_fields.push(metadata_columns.field(idx).clone());
+                                table_cols_stats.push(ColumnStatistics::new_unknown())
+                            }
+                            None => {
+                                panic!("Metadata columns are not set");
+                            }
+                        }
+                    },
+                    datafusion_common::FieldId::Normal(idx) => {
+                        let partition_idx = idx - self.file_schema.fields().len();
+                        table_fields.push(self.table_partition_cols[partition_idx].to_owned());
+                        // TODO provide accurate stat for partition column (#1186)
+                        table_cols_stats.push(ColumnStatistics::new_unknown())
+                    }
+                }
             }
         }
 
@@ -758,6 +789,7 @@ mod tests {
                 .iter()
                 .map(|x| x.0.clone())
                 .collect::<Vec<_>>(),
+            &vec![],
         );
 
         // project first batch

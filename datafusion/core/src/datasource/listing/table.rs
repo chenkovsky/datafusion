@@ -827,6 +827,12 @@ impl TableProvider for ListingTable {
         self
     }
 
+    fn metadata_columns(&self) -> Option<SchemaRef> {
+        Some(Arc::new(Schema::new(
+            vec![Field::new("_rowid", DataType::UInt64, false)],
+        )))
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.table_schema)
     }
@@ -877,7 +883,23 @@ impl TableProvider for ListingTable {
 
         // if no files need to be read, return an `EmptyExec`
         if partitioned_file_lists.is_empty() {
-            let projected_schema = project_schema(&self.schema(), projection)?;
+            let metadata_schema = self.metadata_columns();
+            let projected_schema = match projection {
+                Some(projection) => {
+                    let projection = projection
+                        .iter()
+                        .map(|idx| match datafusion_common::FieldId::from(*idx) {
+                            datafusion_common::FieldId::Normal(i) => Arc::new(self.schema().field(i).clone()),
+                            datafusion_common::FieldId::Metadata(i) => {
+                                Arc::new(metadata_schema.as_ref().unwrap().field(i).clone())
+                            }
+                        })
+                        .collect_vec();
+                    Arc::new(Schema::new(projection))
+                }
+                None => self.schema(),
+            };
+            // let projected_schema = project_schema(&self.schema(), projection)?;
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
@@ -911,6 +933,11 @@ impl TableProvider for ListingTable {
         let filters = match conjunction(filters.to_vec()) {
             Some(expr) => {
                 let table_df_schema = self.table_schema.as_ref().clone().to_dfschema()?;
+                let metadata_schema = self.metadata_columns().map(|s| {
+                    let len = s.fields().len();
+                    datafusion_common::QualifiedSchema::new(s, vec![None; len])
+                }).transpose()?;
+                let table_df_schema = table_df_schema.with_metadata_schema(metadata_schema);
                 let filters = create_physical_expr(
                     &expr,
                     &table_df_schema,
@@ -935,8 +962,9 @@ impl TableProvider for ListingTable {
                 FileScanConfig::new(
                     object_store_url,
                     Arc::clone(&self.file_schema),
-                    self.options.format.file_source(),
+                    self.options.format.file_source()
                 )
+                .with_metadata_columns(self.metadata_columns())
                 .with_file_groups(partitioned_file_lists)
                 .with_constraints(self.constraints.clone())
                 .with_statistics(statistics)
@@ -1194,6 +1222,17 @@ mod tests {
     use datafusion_physical_plan::ExecutionPlanProperties;
 
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn read_parquet_with_metadata() -> Result<()> {
+        let ctx = SessionContext::new();
+        let table = load_table(&ctx, "alltypes_plain.parquet").await?;
+        let _ = ctx.register_table("test", table).unwrap();
+        let df = ctx.sql("select _rowid, * from test").await.unwrap();
+        let batch = df.collect().await.unwrap();
+        println!("{:?}", batch);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn read_single_file() -> Result<()> {

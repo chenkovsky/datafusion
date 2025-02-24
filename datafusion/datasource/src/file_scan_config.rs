@@ -52,7 +52,7 @@ impl PartitionColumnProjector {
     // Create a projector to insert the partitioning columns into batches read from files
     // - `projected_schema`: the target schema with both file and partitioning columns
     // - `table_partition_cols`: all the partitioning column names
-    pub fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
+    pub fn new(projected_schema: SchemaRef, table_partition_cols: &[String], metadata_projection: &Vec<(usize, usize)>) -> Self {
         let mut idx_map = HashMap::new();
         for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
             if let Ok(schema_idx) = projected_schema.index_of(partition_name) {
@@ -60,7 +60,12 @@ impl PartitionColumnProjector {
             }
         }
 
+        for (schema_idx, metadata_idx) in metadata_projection {
+            idx_map.insert(*metadata_idx, *schema_idx);
+        }
+
         let mut projected_partition_indexes: Vec<_> = idx_map.into_iter().collect();
+
         projected_partition_indexes.sort_by(|(_, a), (_, b)| a.cmp(b));
 
         Self {
@@ -92,6 +97,15 @@ impl PartitionColumnProjector {
 
         let mut cols = file_batch.columns().to_vec();
         for &(pidx, sidx) in &self.projected_partition_indexes {
+            if let datafusion_common::FieldId::Metadata(metadata_idx) = datafusion_common::FieldId::from(pidx) {
+                if metadata_idx == 0{
+                    cols.insert(
+                        sidx,
+                        Arc::new(arrow::array::UInt64Array::from_iter_values(0_u64..file_batch.num_rows() as u64)),
+                    )
+                }
+                continue;
+            }
             let p_value =
                 partition_values
                     .get(pidx)
