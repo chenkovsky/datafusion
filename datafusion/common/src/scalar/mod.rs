@@ -3411,6 +3411,58 @@ impl ScalarValue {
                 .map(|sv| sv.size() - size_of_val(sv))
                 .sum::<usize>()
     }
+
+    /// Performs a deep clone of the ScalarValue, creating new copies of all nested data structures.
+    /// This is different from the standard `clone()` which may share data through `Arc`.
+    /// Aggregation functions like `max` will cost a lot of memory if the data is not cloned.
+    pub fn deep_clone(&self) -> Self {
+        match self {
+            // Complex types need deep clone of their contents
+            ScalarValue::List(array) => {
+                let array = copy_array_data(&array.to_data());
+                let new_array = ListArray::from(array);
+                ScalarValue::List(Arc::new(new_array))
+            }
+            ScalarValue::LargeList(array) => {
+                let array = copy_array_data(&array.to_data());
+                let new_array = LargeListArray::from(array);
+                ScalarValue::LargeList(Arc::new(new_array))
+            }
+            ScalarValue::FixedSizeList(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                let new_array = FixedSizeListArray::from(array);
+                ScalarValue::FixedSizeList(Arc::new(new_array))
+            }
+            ScalarValue::Struct(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                let new_array = StructArray::from(array);
+                ScalarValue::Struct(Arc::new(new_array))
+            }
+            ScalarValue::Map(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                let new_array = MapArray::from(array);
+                ScalarValue::Map(Arc::new(new_array))
+            }
+            ScalarValue::Union(Some((type_id, value)), fields, mode) => {
+                let new_value = Box::new(value.deep_clone());
+                ScalarValue::Union(Some((*type_id, new_value)), fields.clone(), *mode)
+            }
+            ScalarValue::Union(None, fields, mode) => {
+                ScalarValue::Union(None, fields.clone(), *mode)
+            }
+            ScalarValue::Dictionary(key_type, value) => {
+                let new_value = Box::new(value.deep_clone());
+                ScalarValue::Dictionary(key_type.clone(), new_value)
+            }
+            _ => self.clone(),
+        }
+    }
+}
+
+fn copy_array_data(data: &ArrayData) -> ArrayData {
+    let mut copy = MutableArrayData::new(vec![&data], true, data.len());
+    copy.extend(0, 0, data.len());
+    copy.freeze()
 }
 
 macro_rules! impl_scalar {
