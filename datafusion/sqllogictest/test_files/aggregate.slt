@@ -6752,7 +6752,8 @@ select c2, count(*) from test WHERE 1 = 1 group by c2;
 5 1
 6 1
 
-query II rowsort
-SELECT MAX(c) FROM (SELECT STRUCT(1 as 'a', 2 as 'b') AS c UNION SELECT STRUCT(3 as 'a', 4 as 'b') AS c )
+query ?? rowsort
+SELECT MIN(c), MAX(c) FROM (SELECT STRUCT(1 as 'a', 2 as 'b') AS c UNION SELECT STRUCT(3 as 'a', 4 as 'b') AS c )
 ----
-{"a": 1, "b": 2}
+{a: 1, b: 2} {a: 3, b: 4}
+
