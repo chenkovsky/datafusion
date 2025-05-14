@@ -206,3 +206,25 @@ async fn ddl_can_not_be_planned_by_session_state() {
         "This feature is not implemented: Unsupported logical plan: DropTable"
     );
 }
+
+#[tokio::test]
+async fn test_rewrite_distinct_aggregate() {
+    let ctx = SessionContext::new();
+
+    // make a table via SQL
+    ctx.sql(
+        "CREATE EXTERNAL TABLE hits
+STORED AS PARQUET
+LOCATION '/Users/chenchongchen/codes/datafusion/benchmarks/data/hits_partitioned';",
+    )
+    .await
+    .unwrap();
+    let batches = ctx
+        .sql("SELECT COUNT(DISTINCT 1) FROM hits;")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    println!("{:?}", batches);
+}

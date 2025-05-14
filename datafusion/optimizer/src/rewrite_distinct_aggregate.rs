@@ -22,6 +22,7 @@ use datafusion_common::{
     internal_err, tree_node::Transformed, HashSet, Result, ScalarValue,
 };
 use datafusion_expr::builder::project;
+use datafusion_expr::expr::Alias;
 use datafusion_expr::logical_plan::Expand;
 use datafusion_expr::sqlparser::ast::NullTreatment;
 use datafusion_expr::SortExpr;
@@ -195,11 +196,13 @@ impl OptimizerRule for RewriteDistinctAggregate {
             }) => {
                 let aggr_expr = aggr_expr
                     .iter()
-                    .map(|expr| match expr {
-                        Expr::AggregateFunction(func) => Ok(func),
-                        _ => internal_err!("Expected aggregate function"),
-                    })
+                    .map(aggregate_function)
                     .collect::<Result<Vec<_>>>()?;
+
+                if aggr_expr.iter().filter(|f| f.params.distinct).count() <= 1 {
+                    return Ok(Transformed::no(plan));
+                }
+
                 let (distinct_exprs, regular_exprs): (
                     Vec<&AggregateFunction>,
                     Vec<&AggregateFunction>,
@@ -573,21 +576,33 @@ fn must_rewrite(group_expr: &[Expr], distinct_exprs: &[&AggregateFunction]) -> b
     if distinct_exprs.iter().any(|f| f.params.filter.is_some()) {
         return true;
     }
-
     group_expr.is_empty()
         && distinct_exprs
             .iter()
-            .all(|f| f.params.args.iter().all(is_constant))
+            .any(|f| f.params.args.iter().all(is_constant))
 }
 
 fn is_constant(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(_))
 }
 
-pub fn distinct_group(f: &AggregateFunction) -> Result<&Expr> {
+fn distinct_group(f: &AggregateFunction) -> Result<&Expr> {
     let args = &f.params.args;
     if args.len() != 1 {
         return internal_err!("DISTINCT aggregate should have exactly one argument");
     }
     Ok(&args[0])
+}
+
+fn aggregate_function(expr: &Expr) -> Result<&AggregateFunction> {
+    match expr {
+        Expr::Alias(Alias { expr, .. }) => {
+            match expr.as_ref() {
+                Expr::AggregateFunction(f) => Ok(f),
+                other => internal_err!("Invalid aggregate expression '{other:?}'"),
+            }
+        }
+        Expr::AggregateFunction(f) => Ok(f),
+        other => internal_err!("Invalid aggregate expression '{other:?}'"),
+    }
 }
