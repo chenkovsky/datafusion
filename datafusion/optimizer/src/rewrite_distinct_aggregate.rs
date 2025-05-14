@@ -17,23 +17,20 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::Null;
+use arrow::datatypes::{DataType, Field};
 use datafusion_common::{
-    internal_err, tree_node::Transformed, DataFusionError, HashSet, Result, ScalarValue,
+    internal_err, tree_node::Transformed, HashSet, Result, ScalarValue,
 };
 use datafusion_expr::builder::project;
 use datafusion_expr::logical_plan::Expand;
+use datafusion_expr::sqlparser::ast::NullTreatment;
 use datafusion_expr::SortExpr;
 use datafusion_expr::{
-    col,
-    expr::{AggregateFunction, AggregateFunctionParams, ScalarFunction},
-    lit, Aggregate, Expr, ExprFunctionExt, ExprSchemable, LogicalPlan, Projection,
-    Unnest,
+    col, expr::AggregateFunction, lit, Aggregate, Expr, ExprFunctionExt, ExprSchemable,
+    LogicalPlan,
 };
 use datafusion_functions_aggregate::first_last::first_value_udaf;
 use datafusion_functions_aggregate::min_max::max;
-use datafusion_expr::sqlparser::ast::NullTreatment;
 use itertools::Itertools;
 
 use crate::{ApplyOrder, OptimizerConfig, OptimizerRule};
@@ -207,13 +204,13 @@ impl OptimizerRule for RewriteDistinctAggregate {
                     Vec<&AggregateFunction>,
                     Vec<&AggregateFunction>,
                 ) = aggr_expr.iter().partition(|func| func.params.distinct);
-                
+
                 let distinct_groups = distinct_exprs
                     .iter()
-                    .map(|f| {
-                        distinct_group(f).map(|e| (e, f))
-                    }).collect::<Result<Vec<_>>>()?;
-                let distinct_groups = distinct_groups.iter()
+                    .map(|f| distinct_group(f).map(|e| (e, f)))
+                    .collect::<Result<Vec<_>>>()?;
+                let distinct_groups = distinct_groups
+                    .iter()
                     .chunk_by(|(args, _)| args.clone())
                     .into_iter()
                     .map(|(key, group)| {
@@ -221,18 +218,19 @@ impl OptimizerRule for RewriteDistinctAggregate {
                     })
                     .collect::<Vec<_>>();
 
-                if distinct_groups.len() <= 1 && !must_rewrite(group_expr, &distinct_exprs)
+                if distinct_groups.len() <= 1
+                    && !must_rewrite(group_expr, &distinct_exprs)
                 {
                     return Ok(Transformed::no(plan));
                 }
-                
+
                 let distinct_expr_list = distinct_groups
                     .iter()
                     .map(|(key, _)| *key)
                     .filter(|expr| !is_constant(expr))
                     .dedup()
                     .collect::<Vec<_>>();
-                
+
                 let regular_expr_list = regular_exprs
                     .iter()
                     .flat_map(|f| f.params.args.iter())
@@ -284,7 +282,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
                     .enumerate()
                     .map(|(i, expr)| (*expr, i))
                     .collect::<HashMap<_, _>>();
-                
+
                 // group_exprs + distinct_exprs + gid + filter_exprs + regular_exprs + order_by_exprs
                 let mut exprs_in_array = vec![];
 
@@ -400,51 +398,85 @@ impl OptimizerRule for RewriteDistinctAggregate {
                 let expand =
                     LogicalPlan::Expand(Expand::try_new(exprs_in_array, input.clone())?);
 
-                let init_group_expr = group_expr.iter().enumerate().map(|(idx, _)| col(format!("group_{}", idx)))
-                    .chain(distinct_expr_list.iter().enumerate().map(|(idx, e)| col(format!("cat_{}", idx))))
-                    .chain(std::iter::once(col("gid"))).collect();
+                let init_group_expr = group_expr
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| col(format!("group_{}", idx)))
+                    .chain(
+                        distinct_expr_list
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, e)| col(format!("cat_{}", idx))),
+                    )
+                    .chain(std::iter::once(col("gid")))
+                    .collect();
 
-                let init_agg_expr = filter_expr_list.iter().enumerate().map(|(idx, _)| max(col(format!("filter_{}", idx))))
-                    .chain(regular_exprs.iter().map(| f| {
-                        let args = f.params.args.iter().map(|e| {
-                            regular_expr_idx_map.get(e).map(|idx| col(format!("regular_{}", idx))).unwrap_or_else(|| {
-                                e.clone()
+                let init_agg_expr = filter_expr_list
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| max(col(format!("filter_{}", idx))))
+                    .chain(regular_exprs.iter().map(|f| {
+                        let args = f
+                            .params
+                            .args
+                            .iter()
+                            .map(|e| {
+                                regular_expr_idx_map
+                                    .get(e)
+                                    .map(|idx| col(format!("regular_{}", idx)))
+                                    .unwrap_or_else(|| e.clone())
                             })
-                        }).collect();
+                            .collect();
 
                         let filter = f.params.filter.as_ref().map(|e| {
-                            Box::new(regular_expr_idx_map.get(e.as_ref()).map(|idx| col(format!("filter_{}", idx))).unwrap_or_else(|| {
-                                e.as_ref().clone()
-                            }))
+                            Box::new(
+                                regular_expr_idx_map
+                                    .get(e.as_ref())
+                                    .map(|idx| col(format!("filter_{}", idx)))
+                                    .unwrap_or_else(|| e.as_ref().clone()),
+                            )
                         });
 
-                        let order_by: Option<Vec<SortExpr>> = f.params.order_by.as_ref().map(|order_by|
-                            order_by.iter().map(|s| {
-                                SortExpr::new(
-                                    order_by_expr_idx_map.get(&s.expr).map(|idx| col(format!("order_by_{}", idx))).unwrap_or_else(|| {
-                                        s.expr.clone()
-                                    }),
-                                    s.asc,
-                                    s.nulls_first
-                                )
-                            }).collect::<Vec<_>>()
-                        );
+                        let order_by: Option<Vec<SortExpr>> =
+                            f.params.order_by.as_ref().map(|order_by| {
+                                order_by
+                                    .iter()
+                                    .map(|s| {
+                                        SortExpr::new(
+                                            order_by_expr_idx_map
+                                                .get(&s.expr)
+                                                .map(|idx| {
+                                                    col(format!("order_by_{}", idx))
+                                                })
+                                                .unwrap_or_else(|| s.expr.clone()),
+                                            s.asc,
+                                            s.nulls_first,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
                         Expr::AggregateFunction(AggregateFunction::new_udf(
-                            f.func.clone(), 
+                            f.func.clone(),
                             args,
                             false,
-                            filter, 
+                            filter,
                             order_by,
-                            f.params.null_treatment.clone()))
-                    })).collect();
+                            f.params.null_treatment.clone(),
+                        ))
+                    }))
+                    .collect();
 
                 let init_agg = LogicalPlan::Aggregate(Aggregate::try_new(
-                    Arc::new(expand), 
+                    Arc::new(expand),
                     init_group_expr,
-                    init_agg_expr
+                    init_agg_expr,
                 )?);
 
-                let final_group_expr = group_expr.iter().enumerate().map(|(idx, _)| col(format!("group_{}", idx))).collect::<Vec<_>>();
+                let final_group_expr = group_expr
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| col(format!("group_{}", idx)))
+                    .collect::<Vec<_>>();
                 let mut alias_expr = vec![];
                 let mut final_agg_expr = vec![];
 
@@ -454,57 +486,78 @@ impl OptimizerRule for RewriteDistinctAggregate {
                         let gid = (*distinct_expr_idx_map.get(group).unwrap()) as i64;
                         let mut filter = col("gid").eq(lit(gid));
                         if let Some(e) = f.params.filter.as_ref() {
-                            filter = filter.and(regular_expr_idx_map.get(e.as_ref()).map(|idx| col(format!("filter_{}", idx))).unwrap_or_else(|| {
-                                e.as_ref().clone()
-                            }))
+                            filter = filter.and(
+                                regular_expr_idx_map
+                                    .get(e.as_ref())
+                                    .map(|idx| col(format!("filter_{}", idx)))
+                                    .unwrap_or_else(|| e.as_ref().clone()),
+                            )
                         }
-                        let order_by: Option<Vec<SortExpr>> = f.params.order_by.as_ref().map(|order_by|
-                            order_by.iter().map(|s| {
-                                SortExpr::new(
-                                    order_by_expr_idx_map.get(&s.expr).map(|idx| col(format!("order_by_{}", idx))).unwrap_or_else(|| {
-                                        s.expr.clone()
-                                    }),
-                                    s.asc,
-                                    s.nulls_first
-                                )
-                            }).collect::<Vec<_>>()
-                        );
-    
+                        let order_by: Option<Vec<SortExpr>> =
+                            f.params.order_by.as_ref().map(|order_by| {
+                                order_by
+                                    .iter()
+                                    .map(|s| {
+                                        SortExpr::new(
+                                            order_by_expr_idx_map
+                                                .get(&s.expr)
+                                                .map(|idx| {
+                                                    col(format!("order_by_{}", idx))
+                                                })
+                                                .unwrap_or_else(|| s.expr.clone()),
+                                            s.asc,
+                                            s.nulls_first,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+
                         AggregateFunction::new_udf(
-                            f.func.clone(), 
+                            f.func.clone(),
                             vec![group.clone()],
                             false,
-                            Some(Box::new(filter)), 
+                            Some(Box::new(filter)),
                             order_by,
-                            f.params.null_treatment.clone())
+                            f.params.null_treatment.clone(),
+                        )
                     } else {
-                        let args = f.params.args.iter().map(|e| {
-                            regular_expr_idx_map.get(e).map(|idx| col(format!("regular_{}", idx))).unwrap_or_else(|| {
-                                e.clone()
+                        let args = f
+                            .params
+                            .args
+                            .iter()
+                            .map(|e| {
+                                regular_expr_idx_map
+                                    .get(e)
+                                    .map(|idx| col(format!("regular_{}", idx)))
+                                    .unwrap_or_else(|| e.clone())
                             })
-                        }).collect();
+                            .collect();
                         AggregateFunction::new_udf(
                             first_value_udaf(),
                             args,
                             false,
-                            Some(Box::new(lit("gid").eq(lit(0)))), 
+                            Some(Box::new(lit("gid").eq(lit(0)))),
                             None,
-                            Some(NullTreatment::IgnoreNulls)
+                            Some(NullTreatment::IgnoreNulls),
                         )
                     };
                     let new_expr = Expr::AggregateFunction(new_f);
 
                     let (qualifier, field) = schema.qualified_field(idx);
-                    alias_expr.push(new_expr.clone().alias_qualified(qualifier.cloned(), field.name()));
+                    alias_expr.push(
+                        new_expr
+                            .clone()
+                            .alias_qualified(qualifier.cloned(), field.name()),
+                    );
                     final_agg_expr.push(new_expr);
                 }
 
                 let final_agg = LogicalPlan::Aggregate(Aggregate::try_new(
                     Arc::new(init_agg),
                     final_group_expr,
-                    final_agg_expr
+                    final_agg_expr,
                 )?);
-                Ok(Transformed::yes( project(final_agg, alias_expr)?))
+                Ok(Transformed::yes(project(final_agg, alias_expr)?))
             }
             _ => Ok(Transformed::no(plan)),
         }

@@ -39,7 +39,6 @@ pub struct ExpandExec {
 }
 
 impl ExpandExec {
-
     pub fn try_new_with_schema(
         exprs: Vec<Vec<Arc<dyn PhysicalExpr>>>,
         input: Arc<dyn ExecutionPlan>,
