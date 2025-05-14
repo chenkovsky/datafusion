@@ -75,14 +75,14 @@ impl ExpandExec {
             let expr = row_expr
                 .iter()
                 .zip(schema.fields().iter())
-                .map(|(expr, field)| (expr.clone(), field.name().clone()))
+                .map(|(expr, field)| (Arc::clone(expr), field.name().clone()))
                 .collect::<Vec<_>>();
             let projection_mapping =
                 ProjectionMapping::try_new(expr.as_slice(), &input.schema())?;
             let mut input_eq_properties = input.equivalence_properties().clone();
             input_eq_properties.substitute_oeq_class(&projection_mapping)?;
             eq_properties
-                .push(input_eq_properties.project(&projection_mapping, schema.clone()));
+                .push(input_eq_properties.project(&projection_mapping, Arc::clone(&schema)));
 
             let partitioning =
                 input_partition.project(&projection_mapping, &input_eq_properties);
@@ -119,15 +119,12 @@ impl DisplayAs for ExpandExec {
     ) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exprs = format!(
-                    "{}",
-                    self.exprs
+                let exprs = self.exprs
                         .iter()
                         .map(|lst| {
                             format!("[{}]", lst.iter().map(|e| e.to_string()).join(", "))
                         })
-                        .join(",")
-                );
+                        .join(",").to_string();
                 write!(f, "ExpandExec: exprs=[{}]", exprs)
             }
             DisplayFormatType::TreeRender => {
@@ -168,7 +165,7 @@ impl ExecutionPlan for ExpandExec {
         ExpandExec::try_new_with_schema(
             self.exprs.clone(),
             children.swap_remove(0),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
         )
         .map(|p| Arc::new(p) as _)
     }
@@ -201,18 +198,17 @@ impl ExecutionPlan for ExpandExec {
 
 fn stats_expand(
     mut stats: Statistics,
-    exprs: &Vec<Vec<Arc<dyn PhysicalExpr>>>,
+    exprs: &[Vec<Arc<dyn PhysicalExpr>>],
     schema: SchemaRef,
 ) -> Statistics {
     let mut primitive_row_size = 0;
     let mut primitive_row_size_possible = true;
     let mut column_statistics = vec![];
     let column_num = schema.fields().len();
-    let row_num = exprs.len();
     for col_idx in 0..column_num {
         let mut col_stats: Option<ColumnStatistics> = None;
-        for row_idx in 0..row_num {
-            let expr = &exprs[row_idx][col_idx];
+        for (row_idx, row) in exprs.iter().enumerate() {
+            let expr = &row[col_idx];
             let cur_col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>()
             {
                 stats.column_statistics[col.index()].clone()

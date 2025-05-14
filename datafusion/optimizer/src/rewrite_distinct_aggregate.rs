@@ -26,7 +26,7 @@ use datafusion_expr::logical_plan::Expand;
 use datafusion_expr::sqlparser::ast::NullTreatment;
 use datafusion_expr::SortExpr;
 use datafusion_expr::{
-    col, expr::AggregateFunction, lit, Aggregate, Expr, ExprFunctionExt, ExprSchemable,
+    col, expr::AggregateFunction, lit, Aggregate, Expr, ExprSchemable,
     LogicalPlan,
 };
 use datafusion_functions_aggregate::first_last::first_value_udaf;
@@ -183,7 +183,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        config: &dyn OptimizerConfig,
+        _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Aggregate(Aggregate {
@@ -211,7 +211,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
                     .collect::<Result<Vec<_>>>()?;
                 let distinct_groups = distinct_groups
                     .iter()
-                    .chunk_by(|(args, _)| args.clone())
+                    .chunk_by(|(args, _)| args)
                     .into_iter()
                     .map(|(key, group)| {
                         (key, group.map(|(_, expr)| *expr).collect::<Vec<_>>())
@@ -226,7 +226,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
 
                 let distinct_expr_list = distinct_groups
                     .iter()
-                    .map(|(key, _)| *key)
+                    .map(|(key, _)| **key)
                     .filter(|expr| !is_constant(expr))
                     .dedup()
                     .collect::<Vec<_>>();
@@ -333,7 +333,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
                     exprs.extend(group_expr.clone());
                     // distinct_exprs
                     for expr in distinct_expr_list.iter() {
-                        if key == expr {
+                        if key == &expr {
                             exprs.push((*expr).clone());
                         } else {
                             exprs.push(Expr::Literal(ScalarValue::Null));
@@ -396,7 +396,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
                 }
 
                 let expand =
-                    LogicalPlan::Expand(Expand::try_new(exprs_in_array, input.clone())?);
+                    LogicalPlan::Expand(Expand::try_new(exprs_in_array, Arc::clone(input))?);
 
                 let init_group_expr = group_expr
                     .iter()
@@ -406,7 +406,7 @@ impl OptimizerRule for RewriteDistinctAggregate {
                         distinct_expr_list
                             .iter()
                             .enumerate()
-                            .map(|(idx, e)| col(format!("cat_{}", idx))),
+                            .map(|(idx, _)| col(format!("cat_{}", idx))),
                     )
                     .chain(std::iter::once(col("gid")))
                     .collect();
@@ -456,12 +456,12 @@ impl OptimizerRule for RewriteDistinctAggregate {
                                     .collect::<Vec<_>>()
                             });
                         Expr::AggregateFunction(AggregateFunction::new_udf(
-                            f.func.clone(),
+                            Arc::clone(&f.func),
                             args,
                             false,
                             filter,
                             order_by,
-                            f.params.null_treatment.clone(),
+                            f.params.null_treatment,
                         ))
                     }))
                     .collect();
@@ -513,12 +513,12 @@ impl OptimizerRule for RewriteDistinctAggregate {
                             });
 
                         AggregateFunction::new_udf(
-                            f.func.clone(),
+                            Arc::clone(&f.func),
                             vec![group.clone()],
                             false,
                             Some(Box::new(filter)),
                             order_by,
-                            f.params.null_treatment.clone(),
+                            f.params.null_treatment,
                         )
                     } else {
                         let args = f
@@ -581,10 +581,7 @@ fn must_rewrite(group_expr: &[Expr], distinct_exprs: &[&AggregateFunction]) -> b
 }
 
 fn is_constant(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(_) => true,
-        _ => false,
-    }
+    matches!(expr, Expr::Literal(_))
 }
 
 pub fn distinct_group(f: &AggregateFunction) -> Result<&Expr> {

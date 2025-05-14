@@ -2833,7 +2833,7 @@ impl Union {
     ) -> Result<DFSchemaRef> {
         let schemas = inputs
             .iter()
-            .map(|input| input.schema().clone())
+            .map(|input| Arc::clone(input.schema()))
             .collect::<Vec<_>>();
         derive_schema_from_inputs_by_position(&schemas, loose_types, "UNION")
     }
@@ -4048,7 +4048,7 @@ impl Expand {
     pub fn try_new(expr: Vec<Vec<Expr>>, input: Arc<LogicalPlan>) -> Result<Self> {
         let schemas = expr
             .iter()
-            .map(|row| projection_schema(&input, &row))
+            .map(|row| projection_schema(&input, row))
             .collect::<Result<Vec<_>>>()?;
         let schema = derive_schema_from_inputs_by_position(&schemas, false, "EXPAND")?;
         Ok(Self {

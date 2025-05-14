@@ -2025,7 +2025,7 @@ impl DefaultPhysicalPlanner {
 
         Ok(Arc::new(ExpandExec::try_new_with_schema(
             physical_exprs,
-            input_exec.clone(),
+            input_exec,
             Arc::new(input.schema().as_arrow().clone()),
         )?))
     }
