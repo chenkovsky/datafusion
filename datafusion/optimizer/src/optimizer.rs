@@ -51,6 +51,7 @@ use crate::propagate_empty_relation::PropagateEmptyRelation;
 use crate::push_down_filter::PushDownFilter;
 use crate::push_down_limit::PushDownLimit;
 use crate::replace_distinct_aggregate::ReplaceDistinctWithAggregate;
+use crate::rewrite_distinct_aggregate::RewriteDistinctAggregate;
 use crate::scalar_subquery_to_join::ScalarSubqueryToJoin;
 use crate::simplify_expressions::SimplifyExpressions;
 use crate::single_distinct_to_groupby::SingleDistinctToGroupBy;
@@ -245,6 +246,7 @@ impl Optimizer {
             Arc::new(EliminateGroupByConstant::new()),
             Arc::new(CommonSubexprEliminate::new()),
             Arc::new(OptimizeProjections::new()),
+            Arc::new(RewriteDistinctAggregate::new()),
         ];
 
         Self::with_rules(rules)

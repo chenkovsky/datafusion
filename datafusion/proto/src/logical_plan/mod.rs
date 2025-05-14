@@ -1805,6 +1805,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
+            &LogicalPlan::Expand(_) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for Expand",
+            )),
         }
     }
 }

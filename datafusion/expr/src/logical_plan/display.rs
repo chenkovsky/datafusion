@@ -612,6 +612,11 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     "Node Type": "Union"
                 })
             }
+            LogicalPlan::Expand(_) => {
+                json!({
+                    "Node Type": "Expand"
+                })
+            }
             LogicalPlan::Extension(e) => {
                 json!({
                     "Node Type": e.node.name(),

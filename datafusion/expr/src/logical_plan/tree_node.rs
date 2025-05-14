@@ -39,9 +39,9 @@
 
 use crate::{
     dml::CopyTo, Aggregate, Analyze, CreateMemoryTable, CreateView, DdlStatement,
-    Distinct, DistinctOn, DmlStatement, Execute, Explain, Expr, Extension, Filter, Join,
-    Limit, LogicalPlan, Partitioning, Prepare, Projection, RecursiveQuery, Repartition,
-    Sort, Statement, Subquery, SubqueryAlias, TableScan, Union, Unnest,
+    Distinct, DistinctOn, DmlStatement, Execute, Expand, Explain, Expr, Extension,
+    Filter, Join, Limit, LogicalPlan, Partitioning, Prepare, Projection, RecursiveQuery,
+    Repartition, Sort, Statement, Subquery, SubqueryAlias, TableScan, Union, Unnest,
     UserDefinedLogicalNode, Values, Window,
 };
 use datafusion_common::tree_node::TreeNodeRefContainer;
@@ -80,6 +80,17 @@ impl TreeNode for LogicalPlan {
                 schema,
             }) => input.map_elements(f)?.update_data(|input| {
                 LogicalPlan::Projection(Projection {
+                    expr,
+                    input,
+                    schema,
+                })
+            }),
+            LogicalPlan::Expand(Expand {
+                expr,
+                input,
+                schema,
+            }) => input.map_elements(f)?.update_data(|input| {
+                LogicalPlan::Expand(Expand {
                     expr,
                     input,
                     schema,
@@ -479,7 +490,8 @@ impl LogicalPlan {
             | LogicalPlan::Dml(_)
             | LogicalPlan::Ddl(_)
             | LogicalPlan::Copy(_)
-            | LogicalPlan::DescribeTable(_) => Ok(TreeNodeRecursion::Continue),
+            | LogicalPlan::DescribeTable(_)
+            | LogicalPlan::Expand(_) => Ok(TreeNodeRecursion::Continue),
         }
     }
 
@@ -501,6 +513,17 @@ impl LogicalPlan {
                 schema,
             }) => expr.map_elements(f)?.update_data(|expr| {
                 LogicalPlan::Projection(Projection {
+                    expr,
+                    input,
+                    schema,
+                })
+            }),
+            LogicalPlan::Expand(Expand {
+                expr,
+                input,
+                schema,
+            }) => expr.map_elements(f)?.update_data(|expr| {
+                LogicalPlan::Expand(Expand {
                     expr,
                     input,
                     schema,

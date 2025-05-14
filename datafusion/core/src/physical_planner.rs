@@ -56,6 +56,7 @@ use crate::physical_plan::{
     Partitioning, PhysicalExpr, WindowExpr,
 };
 use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::expand::ExpandExec;
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 
 use arrow::array::{builder::StringBuilder, RecordBatch};
@@ -76,9 +77,7 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    Analyze, DescribeTable, DmlStatement, Explain, ExplainFormat, Extension, FetchType,
-    Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame,
-    WindowFrameBound, WriteOp,
+    Analyze, DescribeTable, DmlStatement, Expand, Explain, ExplainFormat, Extension, FetchType, Filter, JoinType, RecursiveQuery, SkipType, StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::{Column, Literal};
@@ -1174,6 +1173,7 @@ impl DefaultPhysicalPlanner {
 
             // N Children
             LogicalPlan::Union(_) => Arc::new(UnionExec::new(children.vec())),
+            LogicalPlan::Expand(Expand {input, expr, .. }) => self.create_expand_physical_exec(session_state,children.one()?, input, expr.iter().map(|e| e.as_slice()).collect::<Vec<_>>().as_slice())?,
             LogicalPlan::Extension(Extension { node }) => {
                 let mut maybe_plan = None;
                 let children = children.vec();
@@ -1991,6 +1991,27 @@ impl DefaultPhysicalPlanner {
         let projection = None;
         let mem_exec = MemorySourceConfig::try_new_exec(&partitions, schema, projection)?;
         Ok(mem_exec)
+    }
+
+    fn create_expand_physical_exec(
+        &self,
+        session_state: &SessionState,
+        input_exec: Arc<dyn ExecutionPlan>,
+        input: &Arc<LogicalPlan>,
+        expr: &[&[Expr]],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input_logical_schema = input.as_ref().schema();
+        let physical_exprs = expr.iter().map(|row| {
+            row.iter().map(|e| {
+                self.create_physical_expr(e, input_logical_schema, session_state)
+            }).collect::<Result<Vec<_>>>()
+        }).collect::<Result<Vec<_>>>()?;
+
+        Ok(Arc::new(ExpandExec::try_new_with_schema(
+            physical_exprs,
+            input_exec.clone(),
+            Arc::new(input.schema().as_arrow().clone())
+        )?))
     }
 
     fn create_project_physical_exec(

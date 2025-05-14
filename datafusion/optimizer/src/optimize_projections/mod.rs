@@ -278,6 +278,7 @@ fn optimize_projections(
         | LogicalPlan::Filter(_)
         | LogicalPlan::Repartition(_)
         | LogicalPlan::Union(_)
+        | LogicalPlan::Expand(_)
         | LogicalPlan::SubqueryAlias(_)
         | LogicalPlan::Distinct(Distinct::On(_)) => {
             // Pass index requirements from the parent as well as column indices

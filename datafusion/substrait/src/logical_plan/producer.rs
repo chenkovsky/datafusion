@@ -531,6 +531,7 @@ pub fn to_substrait_rel(
         LogicalPlan::RecursiveQuery(plan) => {
             not_impl_err!("Unsupported plan type: {plan:?}")?
         }
+        LogicalPlan::Expand(plan) => not_impl_err!("Unsupported plan type: {plan:?}")?,
     }
 }
 

@@ -65,6 +65,7 @@ pub mod common;
 pub mod display;
 pub mod empty;
 pub mod execution_plan;
+pub mod expand;
 pub mod explain;
 pub mod filter;
 pub mod filter_pushdown;

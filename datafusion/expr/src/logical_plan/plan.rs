@@ -287,6 +287,9 @@ pub enum LogicalPlan {
     Unnest(Unnest),
     /// A variadic query (e.g. "Recursive CTEs")
     RecursiveQuery(RecursiveQuery),
+    /// Apply a number of projections to every input row,
+    /// hence we will get multiple output rows for an input row.    
+    Expand(Expand),
 }
 
 impl Default for LogicalPlan {
@@ -340,6 +343,7 @@ impl LogicalPlan {
             LogicalPlan::Analyze(analyze) => &analyze.schema,
             LogicalPlan::Extension(extension) => extension.node.schema(),
             LogicalPlan::Union(Union { schema, .. }) => schema,
+            LogicalPlan::Expand(Expand { schema, .. }) => schema,
             LogicalPlan::DescribeTable(DescribeTable { output_schema, .. }) => {
                 output_schema
             }
@@ -362,7 +366,8 @@ impl LogicalPlan {
             | LogicalPlan::Projection(_)
             | LogicalPlan::Aggregate(_)
             | LogicalPlan::Unnest(_)
-            | LogicalPlan::Join(_) => self
+            | LogicalPlan::Join(_)
+            | LogicalPlan::Expand(_) => self
                 .inputs()
                 .iter()
                 .map(|input| input.schema().as_ref())
@@ -459,6 +464,7 @@ impl LogicalPlan {
             LogicalPlan::Union(Union { inputs, .. }) => {
                 inputs.iter().map(|arc| arc.as_ref()).collect()
             }
+            LogicalPlan::Expand(Expand { input, .. }) => vec![input],
             LogicalPlan::Distinct(
                 Distinct::All(input) | Distinct::On(DistinctOn { input, .. }),
             ) => vec![input],
@@ -563,6 +569,9 @@ impl LogicalPlan {
             }
             LogicalPlan::Union(union) => Ok(Some(Expr::Column(Column::from(
                 union.schema.qualified_field(0),
+            )))),
+            LogicalPlan::Expand(expand) => Ok(Some(Expr::Column(Column::from(
+                expand.schema.qualified_field(0),
             )))),
             LogicalPlan::TableScan(table) => Ok(Some(Expr::Column(Column::from(
                 table.projected_schema.qualified_field(0),
@@ -714,6 +723,9 @@ impl LogicalPlan {
                     // column positions.
                     Ok(LogicalPlan::Union(Union::try_new(inputs)?))
                 }
+            }
+            LogicalPlan::Expand(Expand { input, expr, .. }) => {
+                Expand::try_new(expr, input).map(LogicalPlan::Expand)
             }
             LogicalPlan::Distinct(distinct) => {
                 let distinct = match distinct {
@@ -1034,6 +1046,10 @@ impl LogicalPlan {
                     schema,
                 }))
             }
+            LogicalPlan::Expand(Expand { .. }) => {
+                let input = self.only_input(inputs)?;
+                Expand::try_new(vec![expr], Arc::new(input)).map(LogicalPlan::Expand)
+            }
             LogicalPlan::Distinct(distinct) => {
                 let distinct = match distinct {
                     Distinct::All(_) => {
@@ -1351,6 +1367,9 @@ impl LogicalPlan {
                     acc += plan.max_rows()?;
                     Some(acc)
                 })
+            }
+            LogicalPlan::Expand(Expand { input, expr, .. }) => {
+                input.max_rows().map(|max_rows| max_rows * expr.len())
             }
             LogicalPlan::TableScan(TableScan { fetch, .. }) => *fetch,
             LogicalPlan::EmptyRelation(_) => Some(0),
@@ -1994,6 +2013,7 @@ impl LogicalPlan {
                     LogicalPlan::Explain { .. } => write!(f, "Explain"),
                     LogicalPlan::Analyze { .. } => write!(f, "Analyze"),
                     LogicalPlan::Union(_) => write!(f, "Union"),
+                    LogicalPlan::Expand(_) => write!(f, "Expand"),
                     LogicalPlan::Extension(e) => e.node.fmt_for_explain(f),
                     LogicalPlan::DescribeTable(DescribeTable { .. }) => {
                         write!(f, "DescribeTable")
@@ -2811,76 +2831,11 @@ impl Union {
         inputs: &[Arc<LogicalPlan>],
         loose_types: bool,
     ) -> Result<DFSchemaRef> {
-        let first_schema = inputs[0].schema();
-        let fields_count = first_schema.fields().len();
-        for input in inputs.iter().skip(1) {
-            if fields_count != input.schema().fields().len() {
-                return plan_err!(
-                    "UNION queries have different number of columns: \
-                    left has {} columns whereas right has {} columns",
-                    fields_count,
-                    input.schema().fields().len()
-                );
-            }
-        }
-
-        let mut name_counts: HashMap<String, usize> = HashMap::new();
-        let union_fields = (0..fields_count)
-            .map(|i| {
-                let fields = inputs
-                    .iter()
-                    .map(|input| input.schema().field(i))
-                    .collect::<Vec<_>>();
-                let first_field = fields[0];
-                let base_name = first_field.name().to_string();
-
-                let data_type = if loose_types {
-                    // TODO apply type coercion here, or document why it's better to defer
-                    // temporarily use the data type from the left input and later rely on the analyzer to
-                    // coerce the two schemas into a common one.
-                    first_field.data_type()
-                } else {
-                    fields.iter().skip(1).try_fold(
-                        first_field.data_type(),
-                        |acc, field| {
-                            if acc != field.data_type() {
-                                return plan_err!(
-                                    "UNION field {i} have different type in inputs: \
-                                    left has {} whereas right has {}",
-                                    first_field.data_type(),
-                                    field.data_type()
-                                );
-                            }
-                            Ok(acc)
-                        },
-                    )?
-                };
-                let nullable = fields.iter().any(|field| field.is_nullable());
-
-                // Generate unique field name
-                let name = if let Some(count) = name_counts.get_mut(&base_name) {
-                    *count += 1;
-                    format!("{}_{}", base_name, count)
-                } else {
-                    name_counts.insert(base_name.clone(), 0);
-                    base_name
-                };
-
-                let mut field = Field::new(&name, data_type.clone(), nullable);
-                let field_metadata =
-                    intersect_maps(fields.iter().map(|field| field.metadata()));
-                field.set_metadata(field_metadata);
-                Ok((None, Arc::new(field)))
-            })
-            .collect::<Result<_>>()?;
-        let union_schema_metadata =
-            intersect_maps(inputs.iter().map(|input| input.schema().metadata()));
-
-        // Functional Dependencies are not preserved after UNION operation
-        let schema = DFSchema::new_with_metadata(union_fields, union_schema_metadata)?;
-        let schema = Arc::new(schema);
-
-        Ok(schema)
+        let schemas = inputs
+            .iter()
+            .map(|input| input.schema().clone())
+            .collect::<Vec<_>>();
+        derive_schema_from_inputs_by_position(&schemas, loose_types, "UNION")
     }
 }
 
@@ -3988,6 +3943,119 @@ impl PartialOrd for Unnest {
             options: &other.options,
         };
         comparable_self.partial_cmp(&comparable_other)
+    }
+}
+
+fn derive_schema_from_inputs_by_position(
+    inputs: &[DFSchemaRef],
+    loose_types: bool,
+    plan: &str,
+) -> Result<DFSchemaRef> {
+    let first_schema = &inputs[0];
+    let fields_count = first_schema.fields().len();
+    for input in inputs.iter().skip(1) {
+        if fields_count != input.fields().len() {
+            return plan_err!(
+                "{plan} queries have different number of columns: \
+                left has {} columns whereas right has {} columns",
+                fields_count,
+                input.fields().len()
+            );
+        }
+    }
+
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    let union_fields = (0..fields_count)
+        .map(|i| {
+            let fields = inputs
+                .iter()
+                .map(|input| input.field(i))
+                .collect::<Vec<_>>();
+            let first_field = fields[0];
+            let base_name = first_field.name().to_string();
+
+            let data_type = if loose_types {
+                // TODO apply type coercion here, or document why it's better to defer
+                // temporarily use the data type from the left input and later rely on the analyzer to
+                // coerce the two schemas into a common one.
+                first_field.data_type()
+            } else {
+                fields.iter().skip(1).try_fold(
+                    first_field.data_type(),
+                    |acc, field| {
+                        if acc != field.data_type() {
+                            return plan_err!(
+                                "{plan} field {i} have different type in inputs: \
+                                left has {} whereas right has {}",
+                                first_field.data_type(),
+                                field.data_type()
+                            );
+                        }
+                        Ok(acc)
+                    },
+                )?
+            };
+            let nullable = fields.iter().any(|field| field.is_nullable());
+
+            // Generate unique field name
+            let name = if let Some(count) = name_counts.get_mut(&base_name) {
+                *count += 1;
+                format!("{}_{}", base_name, count)
+            } else {
+                name_counts.insert(base_name.clone(), 0);
+                base_name
+            };
+
+            let mut field = Field::new(&name, data_type.clone(), nullable);
+            let field_metadata =
+                intersect_maps(fields.iter().map(|field| field.metadata()));
+            field.set_metadata(field_metadata);
+            Ok((None, Arc::new(field)))
+        })
+        .collect::<Result<_>>()?;
+    let union_schema_metadata =
+        intersect_maps(inputs.iter().map(|input| input.metadata()));
+
+    // Functional Dependencies are not preserved after UNION operation
+    let schema = DFSchema::new_with_metadata(union_fields, union_schema_metadata)?;
+    let schema = Arc::new(schema);
+
+    Ok(schema)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub struct Expand {
+    /// The list of expressions
+    pub expr: Vec<Vec<Expr>>,
+    /// The incoming logical plan
+    pub input: Arc<LogicalPlan>,
+    /// The schema description of the output
+    pub schema: DFSchemaRef,
+}
+
+// Manual implementation needed because of `schema` field. Comparison excludes this field.
+impl PartialOrd for Expand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.expr.partial_cmp(&other.expr) {
+            Some(Ordering::Equal) => self.input.partial_cmp(&other.input),
+            cmp => cmp,
+        }
+    }
+}
+
+impl Expand {
+    pub fn try_new(expr: Vec<Vec<Expr>>, input: Arc<LogicalPlan>) -> Result<Self> {
+        let schemas = expr
+            .iter()
+            .map(|row| projection_schema(&input, &row))
+            .collect::<Result<Vec<_>>>()?;
+        let schema = derive_schema_from_inputs_by_position(&schemas, false, "EXPAND")?;
+        Ok(Self {
+            expr,
+            input,
+            schema,
+        })
     }
 }
 

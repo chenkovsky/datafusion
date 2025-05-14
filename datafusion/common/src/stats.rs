@@ -638,6 +638,16 @@ impl ColumnStatistics {
         }
     }
 
+    pub fn merge(&self, other: &Self) -> Self {
+        Self {
+            null_count: self.null_count.add(&other.null_count),
+            max_value: self.max_value.max(&other.max_value),
+            min_value: self.min_value.min(&other.min_value),
+            sum_value: self.sum_value.add(&other.sum_value),
+            distinct_count: self.distinct_count.add(&other.distinct_count).to_inexact(),
+        }
+    }
+
     /// Returns a [`ColumnStatistics`] instance having all [`Precision::Absent`] parameters.
     pub fn new_unknown() -> Self {
         Self {

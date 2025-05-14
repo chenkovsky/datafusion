@@ -548,6 +548,7 @@ impl OptimizerRule for CommonSubexprEliminate {
             LogicalPlan::Join(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Union(_)
+            | LogicalPlan::Expand(_)
             | LogicalPlan::TableScan(_)
             | LogicalPlan::Values(_)
             | LogicalPlan::EmptyRelation(_)
