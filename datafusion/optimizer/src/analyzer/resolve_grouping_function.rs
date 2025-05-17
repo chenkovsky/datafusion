@@ -26,11 +26,11 @@ use crate::analyzer::AnalyzerRule;
 
 use arrow::datatypes::DataType;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     internal_datafusion_err, plan_err, Column, DFSchemaRef, Result, ScalarValue,
 };
-use datafusion_expr::expr::{AggregateFunction, Alias};
+use datafusion_expr::expr::{AggregateFunction, Alias, ScalarFunction};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::utils::grouping_set_to_exprlist;
 use datafusion_expr::{
@@ -108,7 +108,39 @@ fn replace_grouping_exprs(
                     column.relation,
                     column.name,
                 )));
-            }
+            },
+            Expr::AggregateFunction(ref function) => {
+                // Mutate the filter to replace grouping function with literal 0
+                if let Some(filter) = &function.params.filter {
+                    if contains_scalar_grouping_function(&**filter) {
+                        let mut new_function = function.clone();
+                        let new_filter = (*new_function.params.filter.unwrap()).transform_down(|expr| {
+                            if is_grouping_function(&expr) {
+                                match &expr {
+                                    Expr::ScalarFunction(ScalarFunction{args, ..}) => {
+                                        let grouping_expr = compute_grouping_function_value(
+                                            &args,
+                             &group_expr_to_bitmap_index,
+                                            is_grouping_set,
+                                        )?;
+                                        Ok(Transformed::yes(grouping_expr))
+                                    }
+                                    _ => Ok(Transformed::no(expr))
+                                }
+                            } else {
+                                Ok(Transformed::no(expr))
+                            }
+                        })?;
+                        
+                        new_function.params.filter = Some(Box::new(new_filter.data));
+                        new_agg_expr.push(Expr::AggregateFunction(new_function));
+                        projection_exprs.push(Expr::Column(column));
+                        continue;
+                    }
+                }
+                new_agg_expr.push(expr);
+                projection_exprs.push(Expr::Column(column));
+            },
             _ => {
                 projection_exprs.push(Expr::Column(column));
                 new_agg_expr.push(expr);
@@ -153,6 +185,23 @@ fn is_grouping_function(expr: &Expr) -> bool {
     matches!(expr, Expr::AggregateFunction(AggregateFunction { ref func, .. }) if func.name() == "grouping")
 }
 
+fn is_scalar_grouping_function(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(ScalarFunction {ref func, .. }) if func.name() == "grouping")
+}
+
+fn contains_scalar_grouping_function(expr: &Expr) -> bool {
+    let mut contains = false;
+    let _ = expr.apply(|e| {
+        if is_scalar_grouping_function(e) {
+            contains = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    contains
+}
+
 fn contains_grouping_function(exprs: &[Expr]) -> bool {
     exprs.iter().any(is_grouping_function)
 }
@@ -185,7 +234,14 @@ fn grouping_function_on_id(
 ) -> Result<Expr> {
     validate_args(function, group_by_expr)?;
     let args = &function.params.args;
+    compute_grouping_function_value(args, group_by_expr, is_grouping_set)
+}
 
+fn compute_grouping_function_value(
+    args: &[Expr],
+    group_by_expr: &HashMap<&Expr, usize>,
+    is_grouping_set: bool,
+) -> Result<Expr> {
     // Postgres allows grouping function for group by without grouping sets, the result is then
     // always 0
     if !is_grouping_set {
