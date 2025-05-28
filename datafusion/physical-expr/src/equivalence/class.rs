@@ -23,6 +23,7 @@ use crate::{
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinType, ScalarValue};
 use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::sync::Arc;
 use std::vec::IntoIter;
@@ -412,38 +413,53 @@ impl EquivalenceGroup {
 
     /// Removes redundant entries from this group.
     fn remove_redundant_entries(&mut self) {
-        // Remove duplicate entries from each equivalence class:
-        self.classes.retain_mut(|cls| {
-            // Keep groups that have at least two entries as singleton class is
-            // meaningless (i.e. it contains no non-trivial information):
-            cls.len() > 1
-        });
-        // Unify/bridge groups that have common expressions:
-        self.bridge_classes()
-    }
-
-    /// This utility function unifies/bridges classes that have common expressions.
-    /// For example, assume that we have [`EquivalenceClass`]es `[a, b]` and `[b, c]`.
-    /// Since both classes contain `b`, columns `a`, `b` and `c` are actually all
-    /// equal and belong to one class. This utility converts merges such classes.
-    fn bridge_classes(&mut self) {
-        let mut idx = 0;
-        while idx < self.classes.len() {
-            let mut next_idx = idx + 1;
-            let start_size = self.classes[idx].len();
-            while next_idx < self.classes.len() {
-                if self.classes[idx].contains_any(&self.classes[next_idx]) {
-                    let extension = self.classes.swap_remove(next_idx);
-                    self.classes[idx].extend(extension);
-                } else {
-                    next_idx += 1;
+        // construct a graph of expressions
+        let mut exprs_to_idx = HashMap::new();
+        let mut exprs = vec![];
+        let mut edges = HashMap::new();
+        for cls in self.classes.iter() {
+            let mut first_expr_idx = None;
+            for expr in cls.iter() {
+                let idx = exprs.len();
+                let cur_idx = *exprs_to_idx.entry(expr).or_insert(idx);
+                if cur_idx == idx {
+                    exprs.push(expr);
+                }
+                match first_expr_idx {
+                    None => first_expr_idx = Some(cur_idx),
+                    Some(first_expr_idx) => {
+                        edges.entry(first_expr_idx).or_insert_with(Vec::new).push(cur_idx);
+                        edges.entry(cur_idx).or_insert_with(Vec::new).push(first_expr_idx);
+                    }
                 }
             }
-            if self.classes[idx].len() > start_size {
-                continue;
-            }
-            idx += 1;
         }
+        // use bfs to find the connected components
+        let mut visited = vec![false; exprs.len()];
+        let mut queue = VecDeque::new();
+        let mut new_classes = vec![];
+        for i in 0..exprs.len() {
+            if !visited[i] {
+                let mut class = vec![];
+                visited[i] = true;
+                queue.push_back(i);
+                while let Some(cur) = queue.pop_front() {
+                    class.push(exprs[cur].clone());
+                    if let Some(neighbors) = edges.get(&cur) {
+                        for neighbor in neighbors {
+                            if !visited[*neighbor] {
+                                visited[*neighbor] = true;
+                                queue.push_back(*neighbor);
+                            }
+                        }
+                    }
+                }
+                if class.len() > 1 {
+                    new_classes.push(EquivalenceClass::new(class));
+                }
+            }
+        }
+        self.classes = new_classes;
     }
 
     /// Extends this equivalence group with the `other` equivalence group.
@@ -795,7 +811,7 @@ mod tests {
                 .map(EquivalenceClass::new)
                 .collect::<Vec<_>>();
             let mut eq_groups = EquivalenceGroup::new(entries.clone());
-            eq_groups.bridge_classes();
+            eq_groups.remove_redundant_entries();
             let eq_groups = eq_groups.classes;
             let err_msg = format!(
                 "error in test entries: {entries:?}, expected: {expected:?}, actual:{eq_groups:?}"
