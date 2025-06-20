@@ -206,3 +206,67 @@ async fn ddl_can_not_be_planned_by_session_state() {
         "This feature is not implemented: Unsupported logical plan: DropTable"
     );
 }
+
+
+#[test]
+fn test_array_has() -> Result<(), DataFusionError> {
+    let haystack_field = Arc::new(Field::new_list(
+        "haystack",
+        Field::new_list(
+            "",
+            Field::new("", DataType::Utf8, true),
+            true,
+        ),
+        true,
+    ));
+    let needle_field = Arc::new(Field::new_list(
+        "needle",
+        Field::new("", DataType::Utf8, true),
+        true,
+    ));
+    let return_field = Arc::new(Field::new_list(
+        "return",
+        Field::new("", DataType::Boolean, true),
+        true,
+    ));
+    
+    let string_builder = StringViewBuilder::new();
+    // Fails when using GenericStringBuilder
+    // let string_builder: GenericStringBuilder<i32> = GenericStringBuilder::new();
+    let mut haystack_builder = ListBuilder::new(string_builder);
+   
+    // Append null array 
+    haystack_builder.append_null();
+
+    let haystack = ColumnarValue::Array(Arc::new(haystack_builder.finish()));
+    let needle = ColumnarValue::Scalar(ScalarValue::Utf8(Some("foo".to_string())));
+
+    let result = ArrayHas::new().invoke_with_args(ScalarFunctionArgs {
+        args: vec![haystack, needle],
+        arg_fields: vec![haystack_field.clone(), needle_field.clone()],
+        number_rows: 1,
+        return_field: return_field.clone(),
+    })?;
+    
+    match result.into_array(1)?.as_boolean_opt() {
+        None => {
+            assert!(false, "Expected boolean array");
+        }
+        Some(boolean_array) => {
+            for b in boolean_array {
+                match b {
+                    None => {
+                        assert!(false, "Unexpected null value");
+                    }
+                    Some(true) => {
+                        assert!(false, "Unexpected true value");
+                    }
+                    Some(false) => {
+                        // Ok
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -2226,6 +2226,7 @@ dependencies = [
  "indexmap 2.9.0",
  "insta",
  "paste",
+ "rand 0.9.1",
  "recursive",
  "serde_json",
  "sqlparser",

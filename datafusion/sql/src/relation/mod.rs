@@ -25,8 +25,11 @@ use datafusion_common::{
 };
 use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
-use datafusion_expr::{Subquery, SubqueryAlias};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
+use datafusion_expr::{Repartition, Subquery, SubqueryAlias};
+use sqlparser::ast::{
+    FunctionArg, FunctionArgExpr, Spanned, TableFactor, TableSampleKind,
+    TableSampleMethod, TableSampleUnit,
+};
 
 mod join;
 
@@ -40,7 +43,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let relation_span = relation.span();
         let (plan, alias) = match relation {
             TableFactor::Table {
-                name, alias, args, ..
+                name, alias, args, sample, ..
             } => {
                 if let Some(func_args) = args {
                     let tbl_func_name =
@@ -64,7 +67,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let provider = self
                         .context_provider
                         .get_table_function_source(&tbl_func_name, args)?;
-                    let plan = LogicalPlanBuilder::scan(
+                    let mut plan = LogicalPlanBuilder::scan(
                         TableReference::Bare {
                             table: "tmp_table".into(),
                         },
@@ -72,34 +75,38 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         None,
                     )?
                     .build()?;
+                    if let Some(sample) = sample {
+                        plan = self.table_sample(sample, plan, planner_context)?;
+                    }
                     (plan, alias)
                 } else {
                     // Normalize name and alias
                     let table_ref = self.object_name_to_table_reference(name)?;
                     let table_name = table_ref.to_string();
                     let cte = planner_context.get_cte(&table_name);
-                    (
-                        match (
-                            cte,
-                            self.context_provider.get_table_source(table_ref.clone()),
-                        ) {
-                            (Some(cte_plan), _) => Ok(cte_plan.clone()),
-                            (_, Ok(provider)) => LogicalPlanBuilder::scan(
-                                table_ref.clone(),
-                                provider,
-                                None,
-                            )?
-                            .build(),
-                            (None, Err(e)) => {
-                                let e = e.with_diagnostic(Diagnostic::new_error(
-                                    format!("table '{table_ref}' not found"),
-                                    Span::try_from_sqlparser_span(relation_span),
-                                ));
-                                Err(e)
-                            }
-                        }?,
-                        alias,
-                    )
+                    let mut plan = match (
+                        cte,
+                        self.context_provider.get_table_source(table_ref.clone()),
+                    ) {
+                        (Some(cte_plan), _) => Ok(cte_plan.clone()),
+                        (_, Ok(provider)) => LogicalPlanBuilder::scan(
+                            table_ref.clone(),
+                            provider,
+                            None,
+                        )?
+                        .build(),
+                        (None, Err(e)) => {
+                            let e = e.with_diagnostic(Diagnostic::new_error(
+                                format!("table '{table_ref}' not found"),
+                                Span::try_from_sqlparser_span(relation_span),
+                            ));
+                            Err(e)
+                        }
+                    }?;
+                    if let Some(sample) = sample {
+                        plan = self.table_sample(sample, plan, planner_context)?;
+                    }
+                    (plan, alias)
                 }
             }
             TableFactor::Derived {
@@ -223,6 +230,74 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 spans: Spans::new(),
             })),
         }
+    }
+
+    fn table_sample(
+        &self,
+        sample: TableSampleKind,
+        input: LogicalPlan,
+        planner_context: &mut PlannerContext,
+    ) -> Result<LogicalPlan> {
+        let sample = match sample {
+            TableSampleKind::BeforeTableAlias(sample) => sample,
+            TableSampleKind::AfterTableAlias(sample) => sample,
+        };
+        if let Some(TableSampleMethod::System) | Some(TableSampleMethod::Block) =
+            sample.name
+        {
+            // Postgres-style sample. Not supported because DataFusion does not have a concept of pages like PostgreSQL.
+            return not_impl_err!("{} is not supported yet", sample.name.unwrap());
+        }
+        if sample.offset.is_some() {
+            // Clickhouse-style sample. Not supported because it requires knowing the total data size.
+            return not_impl_err!("Offset sample is not supported yet");
+        }
+
+        let seed = sample.seed.map(|seed| {
+            let Ok(seed) = seed.to_string().parse::<u64>() else {
+                return plan_err!("seed must be a number");
+            };
+            Ok(seed.to_string())
+        }).transpose()?;
+
+        if let Some(bucket) = sample.bucket {
+            if bucket.on.is_some() {
+                // Hive-style sample, only used when the Hive table is defined with CLUSTERED BY
+                return not_impl_err!("Bucket sample with ON is not supported yet");
+            }
+            
+            let Ok(bucket_num) = bucket.bucket.to_string().parse::<u64>() else {
+                return plan_err!("bucket must be a number");
+            };
+
+            let Ok(total_num) = bucket.total.to_string().parse::<u64>() else {
+                return plan_err!("total must be a number");
+            };
+            let logical_plan = LogicalPlanBuilder::from(input).sample(bucket_num as f64 / total_num, None, seed)?.build()?;
+            return Ok(logical_plan);
+        }
+        if let Some(quantity) = sample.quantity {
+            let value = self.sql_expr_to_logical_expr(
+                quantity.value,
+                input.schema(),
+                planner_context,
+            )?;
+            match quantity.unit {
+                Some(TableSampleUnit::Rows) => {
+                    let logical_plan = LogicalPlanBuilder::from(input).limit(value, None)?.build()?;
+                    return Ok(logical_plan);
+                }
+                Some(TableSampleUnit::Percent) => {
+                    let logical_plan = LogicalPlanBuilder::from(input).sample(value, None, seed)?.build()?;
+                    return Ok(logical_plan);
+                }
+                None => {
+                    // Clickhouse-style sample without unit is not supported yet
+                    return not_impl_err!("Table sample with quantity but no unit (ROWS/PERCENT) is not supported. Please specify either ROWS or PERCENT unit.");
+                }
+            }
+        }
+        Ok(input)
     }
 }
 

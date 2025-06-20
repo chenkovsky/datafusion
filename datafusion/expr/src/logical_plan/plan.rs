@@ -287,6 +287,8 @@ pub enum LogicalPlan {
     Unnest(Unnest),
     /// A variadic query (e.g. "Recursive CTEs")
     RecursiveQuery(RecursiveQuery),
+    /// Sample the input table. This is used to implement SQL `SAMPLE`
+    Sample(Sample),
 }
 
 impl Default for LogicalPlan {
@@ -3993,6 +3995,17 @@ impl PartialOrd for Unnest {
         };
         comparable_self.partial_cmp(&comparable_other)
     }
+}
+
+/// Sample the input table. This is used to implement SQL `SAMPLE`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Sample {
+    /// The input table
+    pub input: Arc<LogicalPlan>,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub with_replacement: bool,
+    pub seed: u64,
 }
 
 #[cfg(test)]
