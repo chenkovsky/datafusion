@@ -21,6 +21,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use rand_distr::{Distribution, Poisson};
 
 use super::{
     DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
@@ -31,10 +32,11 @@ use crate::{
     DisplayFormatType, ExecutionPlan,
 };
 
+use arrow::array::UInt32Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::compute;
-use datafusion_common::{internal_err, Result};
+use datafusion_common::{internal_err, plan_datafusion_err, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 
@@ -42,22 +44,81 @@ use futures::stream::{Stream, StreamExt};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
-/// Sampling method for the SampleExec operator
-#[derive(Debug, Clone, PartialEq)]
-pub enum SamplingMethod {
-    /// Bernoulli sampling - each row is included with probability p
-    Bernoulli(f64),
-    /// Poisson sampling - each row is included with probability 1 - e^(-lambda)
-    Poisson(f64),
+trait Sampler: Send + Sync {
+    fn sample(&mut self, batch: &RecordBatch) -> Result<RecordBatch>;
 }
 
-impl SamplingMethod {
-    /// Get the sampling ratio for this method
-    pub fn ratio(&self) -> f64 {
-        match self {
-            SamplingMethod::Bernoulli(p) => *p,
-            SamplingMethod::Poisson(lambda) => 1.0 - (-lambda).exp(),
+struct BernoulliSampler {
+    lower_bound: f64,
+    upper_bound: f64,
+    rng: StdRng,
+}
+
+impl BernoulliSampler {
+    fn new(lower_bound: f64, upper_bound: f64, seed: u64) -> Self {
+        Self { lower_bound, upper_bound, rng: StdRng::seed_from_u64(seed) }
+    }
+}
+
+impl Sampler for BernoulliSampler {
+    fn sample(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+    
+        if self.upper_bound <= self.lower_bound {
+            return Ok(RecordBatch::new_empty(batch.schema()));
         }
+
+        let mut indices = Vec::new();
+
+        for i in 0..batch.num_rows() {
+            let rnd: f64 = self.rng.random();
+
+            if rnd >= self.lower_bound && rnd < self.upper_bound {
+                indices.push(i as u32);
+            }
+        }
+
+        if indices.is_empty() {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+        let indices = UInt32Array::from(indices);
+        compute::take_record_batch(batch, &indices).map_err(|e| e.into())
+    }
+}
+
+struct PoissonSampler {
+    ratio: f64,
+    poisson: Poisson<f64>,
+    rng: StdRng,
+}
+
+impl PoissonSampler {
+    fn try_new(ratio: f64, seed: u64) -> Result<Self> {
+        let poisson = Poisson::new(ratio).map_err(|e| plan_datafusion_err!("{}", e))?;
+        Ok(Self { ratio, poisson, rng: StdRng::seed_from_u64(seed) })
+    }
+}
+
+impl Sampler for PoissonSampler {
+    fn sample(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if self.ratio <= 0.0 {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+        
+        let mut indices = Vec::new();
+    
+        for i in 0..batch.num_rows() {
+            let k = self.poisson.sample(&mut self.rng) as i32;
+            for _ in 0..k {
+                indices.push(i as u32);
+            }
+        }
+
+        if indices.is_empty() {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+
+        let indices = UInt32Array::from(indices);
+        compute::take_record_batch(batch, &indices).map_err(|e| e.into())
     }
 }
 
@@ -67,8 +128,10 @@ impl SamplingMethod {
 pub struct SampleExec {
     /// The input plan
     input: Arc<dyn ExecutionPlan>,
-    /// The sampling method
-    method: SamplingMethod,
+    /// The lower bound of the sampling ratio
+    lower_bound: f64,
+    /// The upper bound of the sampling ratio
+    upper_bound: f64,
     /// Whether to sample with replacement
     with_replacement: bool,
     /// Random seed for reproducible sampling
@@ -80,7 +143,6 @@ pub struct SampleExec {
 }
 
 impl SampleExec {
-
     /// Create a new SampleExec with a custom sampling method
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
@@ -97,26 +159,11 @@ impl SampleExec {
         }
 
         let cache = Self::compute_properties(&input);
-        let method = if with_replacement {
-            // Use Poisson sampling for replacement
-            let ratio = upper_bound - lower_bound;
-            // Convert ratio to lambda: ratio = 1 - e^(-lambda) => lambda = -ln(1 - ratio)
-            let lambda = if ratio >= 1.0 {
-                f64::INFINITY
-            } else if ratio <= 0.0 {
-                0.0
-            } else {
-                -((1.0 - ratio).ln())
-            };
-            SamplingMethod::Poisson(lambda)
-        } else {
-            // Use Bernoulli sampling for no replacement
-            SamplingMethod::Bernoulli(upper_bound - lower_bound)
-        };
 
         Ok(Self {
             input,
-            method,
+            lower_bound,
+            upper_bound,
             with_replacement,
             seed,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -124,14 +171,27 @@ impl SampleExec {
         })
     }
 
-    /// The sampling method
-    pub fn method(&self) -> &SamplingMethod {
-        &self.method
+    fn create_sampler(&self, partition: usize) -> Result<Box<dyn Sampler>> {
+        if self.with_replacement {
+            Ok(Box::new(PoissonSampler::try_new(self.upper_bound - self.lower_bound, self.seed + partition as u64)?))
+        } else {
+            Ok(Box::new(BernoulliSampler::new(self.lower_bound, self.upper_bound, self.seed + partition as u64)))
+        }
     }
 
     /// Whether to sample with replacement
     pub fn with_replacement(&self) -> bool {
         self.with_replacement
+    }
+
+    /// The lower bound of the sampling ratio
+    pub fn lower_bound(&self) -> f64 {
+        self.lower_bound
+    }
+
+    /// The upper bound of the sampling ratio
+    pub fn upper_bound(&self) -> f64 {
+        self.upper_bound
     }
 
     /// The random seed
@@ -165,15 +225,15 @@ impl DisplayAs for SampleExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "SampleExec: method={:?}, with_replacement={}, seed={}",
-                    self.method, self.with_replacement, self.seed
+                    "SampleExec: lower_bound={}, upper_bound={}, with_replacement={}, seed={}",
+                    self.lower_bound, self.upper_bound, self.with_replacement, self.seed
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "SampleExec: method={:?}, with_replacement={}, seed={}",
-                    self.method, self.with_replacement, self.seed
+                    "SampleExec: lower_bound={}, upper_bound={}, with_replacement={}, seed={}",
+                    self.lower_bound, self.upper_bound, self.with_replacement, self.seed
                 )
             }
         }
@@ -206,11 +266,10 @@ impl ExecutionPlan for SampleExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Get the ratio from the current method
-        let ratio = self.method.ratio();
         Ok(Arc::new(SampleExec::try_new(
             children[0].clone(),
-            0.0,
-            ratio,
+            self.lower_bound,
+            self.upper_bound,
             self.with_replacement,
             self.seed,
         )?))
@@ -226,9 +285,7 @@ impl ExecutionPlan for SampleExec {
 
         Ok(Box::pin(SampleExecStream {
             input: input_stream,
-            method: self.method.clone(),
-            with_replacement: self.with_replacement,
-            seed: self.seed,
+            sampler: self.create_sampler(partition)?,
             baseline_metrics,
         }))
     }
@@ -242,10 +299,10 @@ impl ExecutionPlan for SampleExec {
         
         // Apply sampling ratio to statistics
         let mut stats = input_stats;
-        let ratio = self.method.ratio();
+        let ratio = self.upper_bound - self.lower_bound;
         
-        stats.num_rows = stats.num_rows.map(|nr| (nr as f64 * ratio) as usize);
-        stats.total_byte_size = stats.total_byte_size.map(|tb| (tb as f64 * ratio) as usize);
+        stats.num_rows = stats.num_rows.map(|nr| (nr as f64 * ratio) as usize).to_inexact();
+        stats.total_byte_size = stats.total_byte_size.map(|tb| (tb as f64 * ratio) as usize).to_inexact();
         
         Ok(stats)
     }
@@ -256,11 +313,7 @@ struct SampleExecStream {
     /// The input stream
     input: SendableRecordBatchStream,
     /// The sampling method
-    method: SamplingMethod,
-    /// Whether to sample with replacement
-    with_replacement: bool,
-    /// Random seed
-    seed: u64,
+    sampler: Box<dyn Sampler>,
     /// Runtime metrics recording
     baseline_metrics: BaselineMetrics,
 }
@@ -278,7 +331,7 @@ impl Stream for SampleExecStream {
         match poll {
             Poll::Ready(Some(Ok(batch))) => {
                 let start = baseline_metrics.elapsed_compute().clone();
-                let result = sample_batch(&batch, &self.method, self.with_replacement, self.seed);
+                let result = self.sampler.sample(&batch);
                 let _timer = start.timer();
                 Poll::Ready(Some(result))
             }
@@ -287,151 +340,12 @@ impl Stream for SampleExecStream {
             Poll::Pending => Poll::Pending,
         }
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.input.size_hint()
-    }
 }
 
 impl RecordBatchStream for SampleExecStream {
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
-}
-
-/// Sample a record batch based on the given sampling method
-fn sample_batch(
-    batch: &RecordBatch,
-    method: &SamplingMethod,
-    with_replacement: bool,
-    seed: u64,
-) -> Result<RecordBatch> {
-    let num_rows = batch.num_rows();
-    if num_rows == 0 {
-        return Ok(batch.clone());
-    }
-
-    match method {
-        SamplingMethod::Bernoulli(probability) => {
-            if *probability == 0.0 {
-                return Ok(RecordBatch::new_empty(batch.schema()));
-            }
-            if *probability == 1.0 {
-                return Ok(batch.clone());
-            }
-            sample_bernoulli(batch, *probability, with_replacement, seed)
-        }
-        SamplingMethod::Poisson(lambda) => {
-            if *lambda == 0.0 {
-                return Ok(RecordBatch::new_empty(batch.schema()));
-            }
-            sample_poisson(batch, *lambda, with_replacement, seed)
-        }
-    }
-}
-
-/// Bernoulli sampling - each row is included with probability p
-fn sample_bernoulli(
-    batch: &RecordBatch,
-    probability: f64,
-    with_replacement: bool,
-    seed: u64,
-) -> Result<RecordBatch> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut selected_indices = Vec::new();
-
-    for (i, _) in (0..batch.num_rows()).enumerate() {
-        if rng.random_bool(probability) {
-            selected_indices.push(i);
-        }
-    }
-
-    if selected_indices.is_empty() {
-        return Ok(RecordBatch::new_empty(batch.schema()));
-    }
-
-    if with_replacement {
-        // For replacement, we can have duplicate indices
-        let mut sampled_rows = Vec::new();
-        for &index in &selected_indices {
-            let row = batch.slice(index, 1);
-            sampled_rows.push(row);
-        }
-        concatenate_batches(&sampled_rows.iter().collect::<Vec<_>>())
-    } else {
-        // Without replacement, indices are unique
-        selected_indices.sort();
-        let mut sampled_rows = Vec::new();
-        for &index in &selected_indices {
-            let row = batch.slice(index, 1);
-            sampled_rows.push(row);
-        }
-        concatenate_batches(&sampled_rows.iter().collect::<Vec<_>>())
-    }
-}
-
-/// Poisson sampling - each row is included with probability 1 - e^(-lambda)
-fn sample_poisson(
-    batch: &RecordBatch,
-    lambda: f64,
-    with_replacement: bool,
-    seed: u64,
-) -> Result<RecordBatch> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut selected_indices = Vec::new();
-
-    for (i, _) in (0..batch.num_rows()).enumerate() {
-        // Generate Poisson random variable
-        let _k = rng.random_range(0..=10); // Limit to reasonable range
-        let probability = 1.0 - (-lambda).exp();
-        
-        if rng.random_bool(probability) {
-            selected_indices.push(i);
-        }
-    }
-
-    if selected_indices.is_empty() {
-        return Ok(RecordBatch::new_empty(batch.schema()));
-    }
-
-    if with_replacement {
-        // For replacement, we can have duplicate indices
-        let mut sampled_rows = Vec::new();
-        for &index in &selected_indices {
-            let row = batch.slice(index, 1);
-            sampled_rows.push(row);
-        }
-        concatenate_batches(&sampled_rows.iter().collect::<Vec<_>>())
-    } else {
-        // Without replacement, indices are unique
-        selected_indices.sort();
-        let mut sampled_rows = Vec::new();
-        for &index in &selected_indices {
-            let row = batch.slice(index, 1);
-            sampled_rows.push(row);
-        }
-        concatenate_batches(&sampled_rows.iter().collect::<Vec<_>>())
-    }
-}
-
-/// Helper function to concatenate record batches
-fn concatenate_batches(batches: &[&RecordBatch]) -> Result<RecordBatch> {
-    if batches.is_empty() {
-        return internal_err!("Cannot concatenate empty batch list");
-    }
-    
-    let schema = batches[0].schema();
-    let mut columns = Vec::new();
-    
-    for col_idx in 0..schema.fields().len() {
-        let mut arrays = Vec::new();
-        for batch in batches {
-            arrays.push(batch.column(col_idx));
-        }
-        columns.push(compute::concat(&arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?);
-    }
-    
-    Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
 #[cfg(test)]
@@ -496,7 +410,7 @@ mod tests {
             None,
         )?);
 
-        let sample_exec = SampleExec::try_new(input, 0.0, 1.0, false, 42)?;
+        let sample_exec = SampleExec::try_new(input, 0.0, 0.5, true, 42)?;
         
         let context = Arc::new(TaskContext::default());
         let stream = sample_exec.execute(0, context)?;
@@ -506,16 +420,20 @@ mod tests {
         
         Ok(())
     }
-
+    
     #[test]
-    fn test_sampling_methods() {
-        // Test Bernoulli
-        let bernoulli = SamplingMethod::Bernoulli(0.5);
-        assert_eq!(bernoulli.ratio(), 0.5);
+    fn test_sampler_trait() {
+        let mut bernoulli_sampler = BernoulliSampler::new(0.0, 0.5, 42);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", arrow::datatypes::DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        ).unwrap();
+        
+        let result = bernoulli_sampler.sample(&batch);
+        assert!(result.is_ok());
 
-        // Test Poisson
-        let poisson = SamplingMethod::Poisson(0.5);
-        let expected_ratio = 1.0 - (-0.5_f64).exp();
-        assert!((poisson.ratio() - expected_ratio).abs() < 1e-10);
+        let mut poisson_sampler = PoissonSampler::try_new(0.5, 42).unwrap();
+        let result = poisson_sampler.sample(&batch);
+        assert!(result.is_ok());
     }
 }

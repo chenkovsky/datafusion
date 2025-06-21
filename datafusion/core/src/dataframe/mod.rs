@@ -2263,6 +2263,28 @@ impl DataFrame {
         Ok(df)
     }
 
+    /// Sample a fraction of the rows from the DataFrame.
+    ///
+    /// # Arguments
+    /// * `fraction` - The fraction of rows to sample.
+    /// * `with_replacement` - Whether to sample with replacement.
+    /// * `seed` - The seed for the random number generator.
+    ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let df = dataframe!(
+    ///    "id" => [1, 2, 3],
+    ///    "name" => ["foo", "bar", "baz"]
+    ///  )?;
+    /// let df = df.sample(0.5, Some(true), Some(42))?;
+    /// df.show().await?;
+    /// # Ok(())
+    /// ```
+    /// 
     pub fn sample(self, fraction: f64, with_replacement: Option<bool>, seed: Option<u64>) -> Result<Self> {
         let plan = LogicalPlanBuilder::from(self.plan).sample(fraction, with_replacement, seed)?.build()?;
         Ok(DataFrame {

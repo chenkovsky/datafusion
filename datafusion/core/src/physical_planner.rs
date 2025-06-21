@@ -871,14 +871,14 @@ impl DefaultPhysicalPlanner {
                 Arc::new(GlobalLimitExec::new(input, skip, fetch))
             }
             LogicalPlan::Sample(Sample {
-                input,
                 lower_bound,
                 upper_bound,
                 seed,
                 with_replacement,
+                ..
             }) => {
                 let input = children.one()?;
-                let sample = SampleExec::try_new(input, lower_bound, upper_bound, with_replacement, seed)?;
+                let sample = SampleExec::try_new(input, *lower_bound, *upper_bound, *with_replacement, *seed)?;
                 Arc::new(sample)
             }
             LogicalPlan::Unnest(Unnest {

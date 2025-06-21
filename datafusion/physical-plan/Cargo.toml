@@ -63,6 +63,7 @@ log = { workspace = true }
 parking_lot = { workspace = true }
 pin-project-lite = "^0.2.7"
 rand = { workspace = true }
+rand_distr = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

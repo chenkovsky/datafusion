@@ -237,7 +237,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         &self,
         sample: TableSampleKind,
         input: LogicalPlan,
-        planner_context: &mut PlannerContext,
+        _planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
         let sample = match sample {
             TableSampleKind::BeforeTableAlias(sample) => sample,
@@ -294,10 +294,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     if value.is_none() {
                         return plan_err!("quantity must be a number: {:?}", quantity.value);
                     }
-                    let value = value.unwrap();
-                    if value < 0.0 || value > 1.0 {
-                        return plan_err!("quantity must be a number between 0 and 1: {:?}", quantity.value);
-                    }
+                    let value = value.unwrap() / 100.0;
                     let logical_plan = LogicalPlanBuilder::from(input).sample(value, None, seed)?.build()?;
                     return Ok(logical_plan);
                 }
