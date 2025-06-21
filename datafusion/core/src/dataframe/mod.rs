@@ -2262,6 +2262,15 @@ impl DataFrame {
         let df = ctx.read_batch(batch)?;
         Ok(df)
     }
+
+    pub fn sample(self, fraction: f64, with_replacement: Option<bool>, seed: Option<u64>) -> Result<Self> {
+        let plan = LogicalPlanBuilder::from(self.plan).sample(fraction, with_replacement, seed)?.build()?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+            projection_requires_validation: self.projection_requires_validation,
+        })
+    }
 }
 
 /// Macro for creating DataFrame.

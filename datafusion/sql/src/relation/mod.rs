@@ -15,20 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
-    not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference,
+    not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference
 };
 use datafusion_expr::builder::subquery_alias;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
-use datafusion_expr::{Repartition, Subquery, SubqueryAlias};
+use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, Spanned, TableFactor, TableSampleKind,
-    TableSampleMethod, TableSampleUnit,
+    TableSampleUnit,
 };
 
 mod join;
@@ -242,9 +243,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             TableSampleKind::BeforeTableAlias(sample) => sample,
             TableSampleKind::AfterTableAlias(sample) => sample,
         };
-        if let Some(TableSampleMethod::System) | Some(TableSampleMethod::Block) =
-            sample.name
-        {
+        if sample.name.is_some() {
             // Postgres-style sample. Not supported because DataFusion does not have a concept of pages like PostgreSQL.
             return not_impl_err!("{} is not supported yet", sample.name.unwrap());
         }
@@ -257,7 +256,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             let Ok(seed) = seed.to_string().parse::<u64>() else {
                 return plan_err!("seed must be a number");
             };
-            Ok(seed.to_string())
+            Ok(seed)
         }).transpose()?;
 
         if let Some(bucket) = sample.bucket {
@@ -273,27 +272,53 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             let Ok(total_num) = bucket.total.to_string().parse::<u64>() else {
                 return plan_err!("total must be a number");
             };
-            let logical_plan = LogicalPlanBuilder::from(input).sample(bucket_num as f64 / total_num, None, seed)?.build()?;
+            let logical_plan = LogicalPlanBuilder::from(input).sample(bucket_num as f64 / total_num as f64, None, seed)?.build()?;
             return Ok(logical_plan);
         }
         if let Some(quantity) = sample.quantity {
-            let value = self.sql_expr_to_logical_expr(
-                quantity.value,
-                input.schema(),
-                planner_context,
-            )?;
             match quantity.unit {
                 Some(TableSampleUnit::Rows) => {
-                    let logical_plan = LogicalPlanBuilder::from(input).limit(value, None)?.build()?;
+                    let value = evaluate_number::<i64>(&quantity.value);
+                    if value.is_none() {
+                        return plan_err!("quantity must be a non-negative number: {:?}", quantity.value);
+                    }
+                    let value = value.unwrap();
+                    if value < 0 {
+                        return plan_err!("quantity must be a non-negative number: {:?}", quantity.value);
+                    }
+                    let logical_plan = LogicalPlanBuilder::from(input).limit(0, Some(value as usize))?.build()?;
                     return Ok(logical_plan);
                 }
                 Some(TableSampleUnit::Percent) => {
+                    let value = evaluate_number::<f64>(&quantity.value);
+                    if value.is_none() {
+                        return plan_err!("quantity must be a number: {:?}", quantity.value);
+                    }
+                    let value = value.unwrap();
+                    if value < 0.0 || value > 1.0 {
+                        return plan_err!("quantity must be a number between 0 and 1: {:?}", quantity.value);
+                    }
                     let logical_plan = LogicalPlanBuilder::from(input).sample(value, None, seed)?.build()?;
                     return Ok(logical_plan);
                 }
                 None => {
-                    // Clickhouse-style sample without unit is not supported yet
-                    return not_impl_err!("Table sample with quantity but no unit (ROWS/PERCENT) is not supported. Please specify either ROWS or PERCENT unit.");
+                    // Clickhouse-style sample
+                    let value = evaluate_number::<f64>(&quantity.value);
+                    if value.is_none() {
+                        return plan_err!("quantity must be a non-negative number: {:?}", quantity.value);
+                    }
+                    let value = value.unwrap();
+                    if value < 0.0 {
+                        return plan_err!("quantity must be a non-negative number: {:?}", quantity.value);
+                    }
+                    if value >= 1.0 {
+                        let logical_plan = LogicalPlanBuilder::from(input).limit(0, Some(value as usize))?.build()?;
+                        return Ok(logical_plan);
+                    } else {
+                        let logical_plan = LogicalPlanBuilder::from(input).sample(value, None, seed)?.build()?;
+                        return Ok(logical_plan);
+                    }
+                    
                 }
             }
         }
@@ -326,4 +351,39 @@ fn optimize_subquery_sort(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>>
         }
     });
     new_plan
+}
+
+
+fn evaluate_number<T: FromStr + std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std::ops::Mul<Output = T> + std::ops::Div<Output = T>>(expr: &sqlparser::ast::Expr) -> Option<T> {
+    match expr {
+        sqlparser::ast::Expr::BinaryOp { left, op, right } => {
+            let left = evaluate_number::<T>(&left);
+            let right = evaluate_number::<T>(&right);
+            match (left, right) {
+                (Some(left), Some(right)) => {
+                    match op {
+                        sqlparser::ast::BinaryOperator::Plus => Some(left + right),
+                        sqlparser::ast::BinaryOperator::Minus => Some(left - right),
+                        sqlparser::ast::BinaryOperator::Multiply => Some(left * right),
+                        sqlparser::ast::BinaryOperator::Divide => Some(left / right),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        sqlparser::ast::Expr::Value(value) => {
+            match &value.value {
+                sqlparser::ast::Value::Number(value, _) => {
+                    let value = format!("{value}");
+                    let Ok(value) = value.parse::<T>() else {
+                        return None;
+                    };
+                    Some(value)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }

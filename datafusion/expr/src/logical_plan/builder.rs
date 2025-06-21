@@ -44,8 +44,7 @@ use crate::utils::{
     group_window_expr_by_sort_keys,
 };
 use crate::{
-    and, binary_expr, lit, DmlStatement, Expr, ExprSchemable, Operator, RecursiveQuery,
-    Statement, TableProviderFilterPushDown, TableSource, WriteOp,
+    and, binary_expr, lit, DmlStatement, Expr, ExprSchemable, Operator, RecursiveQuery, Statement, TableProviderFilterPushDown, TableSource, WriteOp
 };
 
 use super::dml::InsertOp;
