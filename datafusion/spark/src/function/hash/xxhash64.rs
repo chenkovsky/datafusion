@@ -70,7 +70,7 @@ impl ScalarUDFImpl for SparkXxHash64 {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let func = |arr: &[ArrayRef]| {
-            let mut result = vec![self.seed; arr.len()];
+            let mut result = vec![self.seed; arr[0].len()];
             XxHash64Hasher::hash_arrays(arr, &mut result)?;
             Ok(Arc::new(PrimitiveArray::<Int64Type>::from(result)) as ArrayRef)
         };

@@ -35,7 +35,7 @@ use arrow::datatypes::{
     UInt32Type, UInt64Type, UInt8Type,
 };
 use bigdecimal::num_traits::{Float, ToBytes};
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{exec_err, DataFusionError, Result};
 use std::sync::Arc;
 
 fn hash_impl<T, H: Copy>(
@@ -72,7 +72,7 @@ fn try_hash_impl<T, H: Copy>(
     Ok(())
 }
 
-pub trait SparkHasher<H: Copy> {
+pub trait SparkHasher<H: Copy + std::fmt::Debug> {
     fn oneshot(seed: H, data: &[u8]) -> H;
 
     fn hash_boolean(arr: &BooleanArray, seed: &mut [H]) -> Result<()> {
@@ -91,12 +91,25 @@ pub trait SparkHasher<H: Copy> {
     fn hash_primitive<T, U>(arr: &PrimitiveArray<T>, seed: &mut [H]) -> Result<()>
     where
         T: ArrowPrimitiveType,
-        T::Native: Into<U>,
-        U: ToBytes,
+        U: ToBytes + From<T::Native>,
     {
         hash_impl(arr.iter(), seed, |seed, v| {
-            let bytes = (v.into() as U).to_le_bytes();
+            let bytes = U::from(v).to_le_bytes();
             Self::oneshot(seed, bytes.as_ref())
+        })?;
+        Ok(())
+    }
+
+    fn try_hash_primitive<T, U>(arr: &PrimitiveArray<T>, seed: &mut [H]) -> Result<()>
+    where
+        T: ArrowPrimitiveType,
+        U: ToBytes + TryFrom<T::Native>,
+        <U as TryFrom<T::Native>>::Error: std::fmt::Display,
+    {
+        try_hash_impl(arr.iter(), seed, |seed, v| {
+            let uv = U::try_from(v).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let bytes = uv.to_le_bytes();
+            Ok(Self::oneshot(seed, bytes.as_ref()))
         })?;
         Ok(())
     }
@@ -226,6 +239,9 @@ pub trait SparkHasher<H: Copy> {
     /// Computes the xxHash64 hash of the given data
     fn hash(arr: &ArrayRef, seed: &mut [H]) -> Result<()> {
         match arr.data_type() {
+            DataType::Null => {
+                // do nothing
+            }
             DataType::Boolean => {
                 let arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
                 Self::hash_boolean(arr, seed)?;
@@ -269,6 +285,10 @@ pub trait SparkHasher<H: Copy> {
             DataType::Float64 => {
                 let arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
                 Self::hash_primitive_float::<_, i64>(arr, seed)?;
+            }
+            DataType::Decimal128(precision, _) if *precision <= 18 => {
+                let arr = arr.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                Self::try_hash_primitive::<_, i64>(arr, seed)?;
             }
             DataType::Decimal128(_, _) => {
                 let arr = arr.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -399,7 +419,7 @@ pub trait SparkHasher<H: Copy> {
                     .unwrap();
                 Self::hash_primitive::<_, i32>(arr, seed)?;
             }
-            DataType::Time32(TimeUnit::Nanosecond) => {
+            DataType::Time64(TimeUnit::Nanosecond) => {
                 let arr = arr
                     .as_any()
                     .downcast_ref::<Time64NanosecondArray>()
