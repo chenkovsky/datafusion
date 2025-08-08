@@ -107,7 +107,8 @@ pub trait SparkHasher<H: Copy + std::fmt::Debug> {
         <U as TryFrom<T::Native>>::Error: std::fmt::Display,
     {
         try_hash_impl(arr.iter(), seed, |seed, v| {
-            let uv = U::try_from(v).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let uv =
+                U::try_from(v).map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let bytes = uv.to_le_bytes();
             Ok(Self::oneshot(seed, bytes.as_ref()))
         })?;
@@ -168,10 +169,8 @@ pub trait SparkHasher<H: Copy + std::fmt::Debug> {
             let mut result = [seed; 1];
             for i in 0..len {
                 let slice = v.slice(i, 1);
-                let key = slice.column(0);
-                let value = slice.column(1);
-                Self::hash(&key, &mut result)?;
-                Self::hash(&value, &mut result)?;
+                Self::hash(slice.column(0), &mut result)?;
+                Self::hash(slice.column(1), &mut result)?;
             }
             Ok(result[0])
         })?;

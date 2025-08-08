@@ -69,7 +69,7 @@ impl ScalarUDFImpl for SparkMurmur3Hash {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let func = |arr: &[ArrayRef]| {
-            let mut result = vec![self.seed as i32; arr.len()];
+            let mut result = vec![self.seed as i32; arr[0].len()];
             Murmur3Hasher::hash_arrays(arr, &mut result)?;
             Ok(Arc::new(PrimitiveArray::<Int32Type>::from(result)) as ArrayRef)
         };

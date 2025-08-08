@@ -38,5 +38,5 @@ pub mod expr_fn {
 }
 
 pub fn functions() -> Vec<Arc<ScalarUDF>> {
-    vec![sha2(), xxhash64()]
+    vec![sha2(), xxhash64(), hash()]
 }
